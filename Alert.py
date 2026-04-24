@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import queue
 import smtplib
 import threading
 import time
 import tkinter as tk
+import tomllib
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -19,6 +21,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from tkinter.filedialog import askopenfilename, asksaveasfilename
 from typing import Dict, List, Optional, Tuple
+
+import pystray
+from PIL import Image, ImageDraw
 
 import numpy as np
 import pandas as pd
@@ -48,6 +53,10 @@ try:
 except Exception:
     TWILIO_OK = False
 
+# ── GDrive Local Sync option ────────────────────────────────────────────────────
+# User explicitly requested saving files locally to a mapped folder
+GDRIVE_OK = True
+
 try:
     import win32com.client as _win32com
     WIN32_OK = True
@@ -73,6 +82,11 @@ XML_DIR     = Path("alert_records")
 LOG_QUEUE: queue.Queue[Tuple[str, str]] = queue.Queue()
 DATA_QUEUE: queue.Queue[dict]           = queue.Queue()   # cycle data → GUI
 APP_VERSION = "1"
+
+# ── Dashboard state (thread-safe) ─────────────────────────────────────────────
+_ALERT_HISTORY_LOCK = threading.Lock()
+ALERT_HISTORY: List[dict] = []          # filled by _handle_alert, read by Flask
+MAX_ALERT_HISTORY = 500
 
 COLORS = {
     "bg"      : "#1e2130",
@@ -119,7 +133,7 @@ class ThresholdRule:
     operator        : str   = ">="
     value           : float = 0.0
     alert_level     : str   = "Warning"
-    cooldown_minutes: int   = 30
+    cooldown_minutes: int   = 60   # stored as seconds (name kept for JSON backwards compat)
     enabled         : bool  = True
     _last_alerted   : float = field(default=0.0, compare=False, repr=False)
 
@@ -166,6 +180,12 @@ class SmsSettings:
 
 
 @dataclass
+class GDriveSettings:
+    enabled                 : bool = False
+    local_sync_folder       : str  = ""
+
+
+@dataclass
 class MonitorSettings:
     interval_seconds   : int       = 60
     selected_sensors   : List[str] = field(default_factory=list)
@@ -177,6 +197,7 @@ class AppConfig:
     influx    : InfluxSettings  = field(default_factory=InfluxSettings)
     email     : EmailSettings   = field(default_factory=EmailSettings)
     sms       : SmsSettings     = field(default_factory=SmsSettings)
+    gdrive    : GDriveSettings  = field(default_factory=GDriveSettings)
     monitor   : MonitorSettings = field(default_factory=MonitorSettings)
     thresholds: List[ThresholdRule] = field(default_factory=list)
 
@@ -185,6 +206,7 @@ class AppConfig:
             "influx"    : asdict(self.influx),
             "email"     : asdict(self.email),
             "sms"       : asdict(self.sms),
+            "gdrive"    : asdict(self.gdrive),
             "monitor"   : asdict(self.monitor),
             "thresholds": [
                 {k: v for k, v in asdict(t).items() if not k.startswith("_")}
@@ -201,7 +223,7 @@ class AppConfig:
             raw = json.loads(path.read_text(encoding="utf-8"))
             cfg = cls()
             for key, target in [("influx",cfg.influx),("email",cfg.email),
-                                  ("sms",cfg.sms),("monitor",cfg.monitor)]:
+                                  ("sms",cfg.sms),("gdrive",cfg.gdrive),("monitor",cfg.monitor)]:
                 if key in raw:
                     for k, v in raw[key].items():
                         if hasattr(target, k):
@@ -289,8 +311,22 @@ def xml_path(project: str) -> Path:
     return XML_DIR / f"alerts_{project or 'default'}.xml"
 
 
-def append_xml_alerts(project: str, cycle: int, violations: List[dict]) -> Path:
-    path = xml_path(project)
+
+
+
+def append_xml_alerts(project: str, cycle: int, violations: List[dict], gdrive_cfg: Optional[GDriveSettings] = None) -> str:
+    """Append violations to XML file. If configured with a local GDrive folder, save there."""
+    filename = f"alerts_{project or 'default'}.xml"
+    
+    # Determine save path
+    if gdrive_cfg and gdrive_cfg.enabled and gdrive_cfg.local_sync_folder:
+        target_dir = Path(gdrive_cfg.local_sync_folder)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / filename
+    else:
+        path = xml_path(project)
+
+    # Parse existing or create new root element
     if path.exists():
         try:
             tree = ET.parse(str(path))
@@ -300,6 +336,7 @@ def append_xml_alerts(project: str, cycle: int, violations: List[dict]) -> Path:
     else:
         root = ET.Element("alerts", project=project)
 
+    # Add new event
     ts = datetime.now(LOCAL_TZ).isoformat()
     ev = ET.SubElement(root, "event", timestamp=ts, cycle=str(cycle))
     for v in violations:
@@ -311,10 +348,12 @@ def append_xml_alerts(project: str, cycle: int, violations: List[dict]) -> Path:
                       threshold   = f"{v.get('threshold',0):.6f}",
                       operator    = str(v.get("operator",">=")),
                       alert_level = str(v.get("alert_level","Warning")))
+    
+    # Generate and save XML string
     tree_out = ET.ElementTree(root)
     ET.indent(tree_out, space="  ")
     tree_out.write(str(path), encoding="utf-8", xml_declaration=True)
-    return path
+    return str(path)
 
 
 def load_xml_alerts(path: str) -> List[dict]:
@@ -749,11 +788,11 @@ def _build_html_email(project: str, timestamp: str, cycle: int,
         <td style="padding:24px 32px;background:#f9f9f9;border-top:1px solid #dddddd;">
           <table width="100%" cellpadding="0" cellspacing="0">
             <tr>
-              <td>
-                <div style="background:#fff5f5;padding:16px;border-radius:8px;border-left:4px solid #ff6b7a;">
-                  <span style="color:#d84444;font-size:13px;font-weight:700;display:block;margin-bottom:6px;">⚡ Recommended Action</span>
-                  <span style="color:#555555;font-size:12px;">.</span>
-                </div>
+              <td align="center">
+                <a href="https://renovo-alerts.streamlit.app/" target="_blank" style="display:inline-block;padding:12px 24px;background:#0066cc;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.1);">
+                  View Online Dashboard
+                </a>
+                <p style="color:#666666;font-size:12px;margin:12px 0 0 0;">For detailed analysis, open the online visualization platform.</p>
               </td>
             </tr>
           </table>
@@ -779,8 +818,9 @@ def _build_html_email(project: str, timestamp: str, cycle: int,
 
 
 def compose_email(cfg: EmailSettings, influx: InfluxSettings,
-                  violations: List[dict], cycle: int) -> Tuple[str, str]:
-    ts        = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+                  violations: List[dict], cycle: int,
+                  timestamp: Optional[str] = None) -> Tuple[str, str]:
+    ts        = timestamp if timestamp else datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     max_level = "Critical" if any(v["alert_level"]=="Critical" for v in violations) else "Warning"
     top = max(violations, key=lambda v: v["max_value"]) if violations else {}
     ctx = dict(project=influx.project, timestamp=ts, cycle=cycle,
@@ -893,25 +933,25 @@ def _send_email_win32(cfg: EmailSettings, subject: str, body: str,
             "Then restart the application."
         )
     import win32com.client as win32  # noqa: F401
+    import pythoncom
     import os
     import tempfile
+    
+    # Required for COM when called from background threads
+    pythoncom.CoInitialize()
+
     try:
-        ol = win32.Dispatch("Outlook.Application")
-    except Exception:
         try:
+            ol = win32.Dispatch("Outlook.Application")
+        except Exception:
             ol = win32.DispatchEx("Outlook.Application")
-        except Exception as e:
-            try:
-                import time
-                os.startfile("outlook")
-                time.sleep(3)
-                ol = win32.Dispatch("Outlook.Application")
-            except Exception as e2:
-                raise RuntimeError(
-                    f"COM Dispatch failed: {e2}\n"
-                    "This usually means Outlook is running with different privileges "
-                    "(e.g., as Administrator) than Python. Please run both normally."
-                )
+    except Exception as e:
+        pythoncom.CoUninitialize()
+        raise RuntimeError(
+            f"COM Dispatch failed: {e}\n"
+            "Ensure Outlook is installed and running normally."
+        )
+
     mail = ol.CreateItem(0)          # 0 = olMailItem
     mail.Subject = subject
     mail.Body    = body
@@ -1023,13 +1063,32 @@ def _send_email_win32(cfg: EmailSettings, subject: str, body: str,
         import threading
         threading.Timer(5.0, cleanup_temp).start()
     
-    for addr in [a.strip() for a in cfg.to_addrs.split(",") if a.strip()]:
-        mail.Recipients.Add(addr)
-    mail.Recipients.ResolveAll()
-    
-    # Log before sending
+    # Set recipients using MAPI SMTP address properties directly.
+    # This bypasses Outlook's autocomplete/address book entirely so it is
+    # GUARANTEED to send only to the addresses in cfg.to_addrs.
+    # We do NOT call ResolveAll() which is what was pulling in old cached addresses.
+    PR_SMTP_ADDRESS     = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+    PR_ADDRTYPE         = "http://schemas.microsoft.com/mapi/proptag/0x3002001F"
+    PR_EMAIL_ADDRESS    = "http://schemas.microsoft.com/mapi/proptag/0x3003001F"
+    PR_DISPLAY_NAME     = "http://schemas.microsoft.com/mapi/proptag/0x3001001F"
+    PR_RECIPIENT_TYPE   = "http://schemas.microsoft.com/mapi/proptag/0x0C150003"  # 1 = To
+
+    strict_addrs = [a.strip() for a in cfg.to_addrs.split(",") if a.strip()]
+    for addr in strict_addrs:
+        recip = mail.Recipients.Add(addr)
+        try:
+            pa = recip.PropertyAccessor
+            pa.SetProperty(PR_SMTP_ADDRESS,   addr)
+            pa.SetProperty(PR_EMAIL_ADDRESS,  addr)
+            pa.SetProperty(PR_ADDRTYPE,       "SMTP")
+            pa.SetProperty(PR_DISPLAY_NAME,   addr)
+            pa.SetProperty(PR_RECIPIENT_TYPE, 1)
+        except Exception as pe:
+            print(f"  ⚠ Could not set MAPI props for {addr}: {pe}")
+
+    # Log actual final recipient list — should exactly match cfg.to_addrs
     print(f"📨 Ready to send:")
-    print(f"   Recipients: {[a.strip() for a in cfg.to_addrs.split(',') if a.strip()]}")
+    print(f"   Recipients ({mail.Recipients.Count}): {strict_addrs}")
     print(f"   Attachments: {mail.Attachments.Count}")
     print(f"   HTMLBody length: {len(mail.HTMLBody) if mail.HTMLBody else 0}")
     print(f"   Sending email...")
@@ -1151,7 +1210,10 @@ class AlertEngine:
         if frame.empty:
             self._log("No data returned.", "warning"); return
 
-        dims = [c for c in frame.columns if c not in {"_time","device_name"}]
+        # Only process dimensions the user actually selected to monitor (e.g. velx, vely, velz)
+        mon_dims = set(cfg.monitor.selected_dimensions)
+        dims = [c for c in frame.columns if c not in {"_time", "device_name"} and (not mon_dims or c in mon_dims)]
+        
         self._log(f"Fetched {len(frame)} rows from {frame['device_name'].nunique()} sensor(s).")
 
         # ── Build per-sensor/dim max values ──────────────────────────────────
@@ -1166,6 +1228,15 @@ class AlertEngine:
                         idx = s_dim.abs().idxmax()
                         val = float(s_dim.loc[idx])
                         max_vals[sensor][dim] = val
+
+        # ── Capture actual data timestamp from InfluxDB ──────────────────────
+        data_ts = None
+        try:
+            last_time = frame["_time"].max()
+            if pd.notna(last_time):
+                data_ts = last_time.strftime("%Y-%m-%d %H:%M:%S %Z") if getattr(last_time, 'tzinfo', None) else last_time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
 
         cycle_ts = datetime.now(LOCAL_TZ).isoformat()
         self._on_data({"ts": cycle_ts, "max_vals": max_vals, "cycle": self._cycle})
@@ -1198,21 +1269,20 @@ class AlertEngine:
                                            "operator":rule.operator,"alert_level":rule.alert_level,
                                            "violation_type":"new"})
             
-            # Check if we're in cooldown period
-            in_cooldown = now - rule._last_alerted < rule.cooldown_minutes*60
-            
+            # ── Cooldown (now in seconds; Critical always sends immediately) ──
+            is_critical = rule.alert_level == "Critical"
+            cooldown_secs = rule.cooldown_minutes  # field stores seconds
+            in_cooldown = (not is_critical) and (now - rule._last_alerted < cooldown_secs)
+
             if rule_violations:
                 if in_cooldown:
-                    # In cooldown: store as pending (will send on cooldown expiry)
-                    rem = int((rule.cooldown_minutes*60-(now-rule._last_alerted))/60)
-                    self._log(f"  [PENDING] '{rule.name}' – cooldown {rem}min left. "
+                    rem = int(cooldown_secs - (now - rule._last_alerted))
+                    self._log(f"  [PENDING] '{rule.name}' – cooldown {rem}s left. "
                               f"{len(rule_violations)} violation(s) stored.", "warning")
                     if rule.name not in self._pending_violations:
                         self._pending_violations[rule.name] = []
-                    # Mark current violations as pending
                     for v in rule_violations:
                         v["violation_type"] = "pending"
-                        # Only keep the worst pending violation per sensor/dimension
                         found = False
                         for p in self._pending_violations[rule.name]:
                             if p["sensor"] == v["sensor"] and p["dimension"] == v["dimension"]:
@@ -1223,31 +1293,24 @@ class AlertEngine:
                         if not found:
                             self._pending_violations[rule.name].append(v)
                 else:
-                    # Not in cooldown: send immediately
-                    # Include both pending violations (accumulated during last cooldown) and current ones
                     if rule.name in self._pending_violations:
-                        # Mark pending violations with "pending" type
                         pending_viols = self._pending_violations[rule.name]
-                        num_pending = len(pending_viols)
                         all_violations = pending_viols + rule_violations
                         self._log(f"  [ALERT] '{rule.name}' cooldown expired. "
-                                  f"{num_pending} pending + {len(rule_violations)} new = {len(all_violations)} total violations.",
-                                  "warning")
+                                  f"{len(pending_viols)} pending + {len(rule_violations)} new.", "warning")
                         del self._pending_violations[rule.name]
                     else:
                         all_violations = rule_violations
-                        self._log(f"  [ALERT] '{rule.name}' triggered. {len(rule_violations)} violation(s).", "warning")
+                        tag = "error" if is_critical else "warning"
+                        label = "[CRITICAL] NO cooldown –" if is_critical else "[ALERT]"
+                        self._log(f"  {label} '{rule.name}' triggered. {len(rule_violations)} violation(s).", tag)
                     violations.extend(all_violations)
                     rule._last_alerted = now
             else:
-                # No violations for this rule in current cycle
-                # But check if cooldown just expired - send pending violations
                 if not in_cooldown and rule.name in self._pending_violations:
                     pending_viols = self._pending_violations[rule.name]
-                    num_pending = len(pending_viols)
                     self._log(f"  [ALERT] '{rule.name}' cooldown expired. "
-                              f"{num_pending} pending violations detected during cooldown. Sending email...",
-                              "warning")
+                              f"{len(pending_viols)} pending violations. Sending...", "warning")
                     violations.extend(pending_viols)
                     del self._pending_violations[rule.name]
                     rule._last_alerted = now
@@ -1260,7 +1323,7 @@ class AlertEngine:
                         rule._last_alerted = now
                 self._pending_violations.clear()
         elif violations:
-            self._on_alert(violations, self._cycle)
+            self._on_alert(violations, self._cycle, data_ts)
         else:
             self._log("All sensors within thresholds.", "ok")
 
@@ -1303,7 +1366,10 @@ class App(tk.Tk):
         self.title(f"InfluxDB Alert Monitor  v{APP_VERSION}")
         self.geometry("1100x780")
         self.minsize(900, 640)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._hide_window)
+
+        self._tray_icon    = None
+        self._is_hidden    = False
 
         self.cfg           = AppConfig.load()
         self._engine       : Optional[AlertEngine] = None
@@ -1494,6 +1560,21 @@ class App(tk.Tk):
             var = tk.StringVar(value=default)
             setattr(self, var_name, var)
             ttk.Entry(agg, textvariable=var, width=w).grid(row=1,column=col*2+1,sticky="w")
+            # ── Google Drive ──────────────────────────────────────────────────────
+        gd = ttk.LabelFrame(f, text="☁️  Google Drive Local Sync", padding=12)
+        gd.pack(fill="x", pady=(6,0))
+        self._gdrive_en_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(gd, text="Save XML to local Google Drive folder to auto-sync online",
+                        variable=self._gdrive_en_var).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,6))
+        
+        tk.Label(gd, text="Sync Folder Path:", bg=COLORS["bg"], fg=COLORS["muted"],
+                 font=("Segoe UI",9), anchor="w").grid(row=1,column=0,sticky="w",pady=5,padx=(0,12))
+        self._gdrive_local_folder_var = tk.StringVar(value="")
+        ttk.Entry(gd, textvariable=self._gdrive_local_folder_var, width=52).grid(row=1,column=1,sticky="ew",pady=5)
+        
+        gd.columnconfigure(1, weight=1)
+        ttk.Button(gd, text="📁 Browse Folder",
+                   command=self._browse_gdrive_folder).grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Tab: Monitoring
@@ -2323,6 +2404,9 @@ class App(tk.Tk):
         for k, v in self._ev.items():
             v.set(str(getattr(c.email,k,"")))
         self._tls_var.set(c.email.use_tls)
+        # GDrive
+        self._gdrive_en_var.set(c.gdrive.enabled)
+        self._gdrive_local_folder_var.set(getattr(c.gdrive, "local_sync_folder", ""))
         self._logo_var.set(c.email.logo_path)
         self._subj_var.set(c.email.subject_template)
         self._body_txt.delete("1.0","end")
@@ -2401,6 +2485,11 @@ class App(tk.Tk):
         except Exception as e: print(f"collect err sms body: {e}")
         try: c.sms.to_numbers = ", ".join(getattr(self, "_sms_rec_lb").get(0, "end"))
         except Exception as e: print(f"collect err sms addrs: {e}")
+        # GDrive
+        try: c.gdrive.enabled = getattr(self, "_gdrive_en_var").get()
+        except Exception as e: print(f"collect err gdrive enabled: {e}")
+        try: c.gdrive.local_sync_folder = getattr(self, "_gdrive_local_folder_var").get().strip()
+        except Exception as e: print(f"collect err gdrive local sync folder: {e}")
 
 
 
@@ -2421,13 +2510,16 @@ class App(tk.Tk):
 
     def _start_monitor(self):
         self._collect_cfg_from_ui()
-        # Always sync interval directly so the engine sees the correct value
         try:
             self.cfg.monitor.interval_seconds = _sint(self._interval_var.get(), 60)
         except Exception:
             pass
-        
-        # Start fresh: reset cooldown timers on all rules
+
+        # Always save before starting so the engine uses whatever is currently on screen
+        self.cfg.save()
+        self._log_msg("Configuration auto-saved before monitoring start.", "ok")
+
+        # Reset cooldown timers so first violation always sends immediately
         for rule in self.cfg.thresholds:
             rule._last_alerted = 0.0
             
@@ -2436,6 +2528,9 @@ class App(tk.Tk):
         self._running = True
         self._start_btn.config(text="⏹  Stop Monitoring", style="Stop.TButton")
         self._status_var.set("🟢  Running")
+        
+        # Auto-hide to system tray when monitoring starts
+        self.after(500, self._hide_window)
 
     def _stop_monitor(self):
         if self._engine: self._engine.stop()
@@ -2447,9 +2542,10 @@ class App(tk.Tk):
         """Called from background thread — push to queue for GUI update."""
         DATA_QUEUE.put(payload)
 
-    def _handle_alert(self, violations: List[dict], cycle: int):
+    def _handle_alert(self, violations: List[dict], cycle: int, data_ts: Optional[str] = None):
         """Called from background thread."""
-        subject, body = compose_email(self.cfg.email, self.cfg.influx, violations, cycle)
+        ts = data_ts if data_ts else datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        subject, body = compose_email(self.cfg.email, self.cfg.influx, violations, cycle, ts)
         logo = self.cfg.email.logo_path or ("logo.png" if Path("logo.png").is_file() else "")
         
         # Count new vs pending violations
@@ -2463,7 +2559,6 @@ class App(tk.Tk):
             msg = f"ALERT – {total_count} violation(s). Sending email…"
         LOG_QUEUE.put((msg, "warning"))
 
-        ts        = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         max_level = "Critical" if any(v["alert_level"]=="Critical" for v in violations) else "Warning"
 
         # Email
@@ -2489,10 +2584,36 @@ class App(tk.Tk):
 
         # XML
         try:
-            xml_file = append_xml_alerts(self.cfg.influx.project, cycle, violations)
+            xml_file = append_xml_alerts(self.cfg.influx.project, cycle, violations, self.cfg.gdrive)
             LOG_QUEUE.put((f"XML record saved: {xml_file}","ok"))
         except Exception as exc:
             LOG_QUEUE.put((f"XML save FAILED: {exc}","error"))
+
+        # ── Dashboard history (Brisbane time, thread-safe) ────────────────────
+        _ts_brisb = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S")
+        _entry = {
+            "timestamp" : _ts_brisb,
+            "cycle"     : cycle,
+            "max_level" : max_level,
+            "num_violations": len(violations),
+            "emails_to" : self.cfg.email.to_addrs,
+            "violations": [
+                {
+                    "rule"       : v.get("rule", ""),
+                    "sensor"     : v.get("sensor", ""),
+                    "dimension"  : v.get("dimension", ""),
+                    "max_value"  : v.get("max_value", 0),
+                    "threshold"  : v.get("threshold", 0),
+                    "alert_level": v.get("alert_level", "Warning"),
+                    "type"       : v.get("violation_type", "new"),
+                }
+                for v in violations
+            ],
+        }
+        with _ALERT_HISTORY_LOCK:
+            ALERT_HISTORY.append(_entry)
+            if len(ALERT_HISTORY) > MAX_ALERT_HISTORY:
+                del ALERT_HISTORY[:-MAX_ALERT_HISTORY]
 
         # GUI update (from main thread via pump)
         DATA_QUEUE.put({"violations": violations, "cycle": cycle})
@@ -2511,7 +2632,7 @@ class App(tk.Tk):
             self._tree.insert("","end", tags=(tag,), values=(
                 rule.name, rule.sensor_filter, rule.dimension, rule.operator,
                 f"{rule.value:.5g}", rule.alert_level,
-                f"{rule.cooldown_minutes}m", "✓" if rule.enabled else "✗",
+                f"{rule.cooldown_minutes}s", "✓" if rule.enabled else "✗",
             ))
 
     def _add_rule(self):    RuleDialog(self, None, self._on_rule_saved)
@@ -2630,6 +2751,12 @@ class App(tk.Tk):
             self._conn_status.config(text="● Failed", fg=COLORS["red"])
             self._log_msg(f"Connection failed: {exc}","error")
             messagebox.showerror("Connection Failed", str(exc))
+    
+    def _browse_gdrive_folder(self):
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(title="Select Google Drive Sync Folder")
+        if folder:
+            self._gdrive_local_folder_var.set(folder)
 
     def _load_sensors(self):
         self._collect_cfg_from_ui()
@@ -2825,7 +2952,7 @@ class App(tk.Tk):
             self._last_clear_time = now
 
     def _log_msg(self, msg: str, tag: str = "info"):
-        ts   = datetime.now().strftime("%H:%M:%S")
+        ts   = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S")
         line = f"[{ts}]  {msg}\n"
         self._log_widget.configure(state="normal")
         self._log_widget.insert("end", line, tag)
@@ -2844,18 +2971,68 @@ class App(tk.Tk):
         if path:
             Path(path).write_text(self._log_widget.get("1.0","end"), encoding="utf-8")
 
-    def _on_close(self):
+    def _create_tray_icon(self):
+        """Create the pystray Icon with a menu."""
+        # Create a simple icon image (Red circle with white 'A')
+        image = Image.new('RGB', (64, 64), COLORS["bg"])
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 8, 56, 56), fill=COLORS["red"])
+        # If we had a font we'd draw 'A', but simple circle works for now
+        
+        menu = pystray.Menu(
+            pystray.MenuItem("Restore", self._show_window),
+            pystray.MenuItem("Quit", self._quit_app)
+        )
+        self._tray_icon = pystray.Icon("alert_monitor", image, "Alert Monitor", menu)
+
+    def _hide_window(self):
+        """Hide the main window and show the tray icon."""
+        if self._is_hidden:
+            return
+        
+        self.withdraw()
+        self._is_hidden = True
+        
+        if not self._tray_icon:
+            self._create_tray_icon()
+        
+        # Run the icon on a separate thread so it doesn't block Tkinter
+        if self._tray_icon:
+            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+            self._log_msg("Application minimized to system tray.", "info")
+
+    def _show_window(self, icon=None, item=None):
+        """Restore the main window and stop the tray icon."""
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None          # ← must reset so next hide recreates it
+
+        self.after(0, lambda: self.deiconify())
+        self.after(0, lambda: self.lift())
+        self.after(0, lambda: self.focus_force())
+        self._is_hidden = False
+
+    def _quit_app(self, icon=None, item=None):
+        """Clean up and exit the application."""
+        if self._tray_icon:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        
         if self._running:
             self._stop_monitor()
+        
         try:
             self._collect_cfg_from_ui()
-        except Exception:
-            pass
-        try:
             self.cfg.save()
         except Exception:
             pass
+            
         self.destroy()
+
+    def _on_close(self):
+        # This is now handled by _hide_window in the protocol hook
+        # but kept for reference if needed elsewhere.
+        self._hide_window()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2884,7 +3061,7 @@ class RuleDialog(tk.Toplevel):
             ("Operator",           "_op",      r.operator,         "combo", [">=",">","=="]),
             ("Threshold Value",    "_val",     str(r.value),       "entry", None),
             ("Alert Level",        "_level",   r.alert_level,      "combo", ["Warning","Critical"]),
-            ("Cooldown (minutes)", "_cooldown",str(r.cooldown_minutes),"entry",None),
+            ("Cooldown (seconds)", "_cooldown",str(r.cooldown_minutes),"entry",None),
         ]
         for i,(lbl,attr,default,kind,opts) in enumerate(rows):
             tk.Label(self, text=lbl+":", bg=COLORS["bg"], fg=COLORS["muted"],
@@ -2981,32 +3158,631 @@ def _sint(value, default: int) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _start_flask_app(main_app):
-    from flask import Flask, jsonify
+    from flask import Flask, jsonify, request, Response
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     remote_app = Flask(__name__)
 
+    # ── Helper: param from query-string OR JSON body ──────────────────────────
+    def _param(key, default=None):
+        v = request.args.get(key, default)
+        if v is None and request.is_json:
+            v = request.get_json(silent=True, force=True) or {}
+            v = v.get(key, default)
+        return v
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Control
+    # ════════════════════════════════════════════════════════════════════════
+
     @remote_app.route('/status', methods=['GET'])
     def api_status():
         st = main_app._status_var.get() if main_app else "Stopped"
-        return jsonify({"status": st})
+        ts = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S")
+        return jsonify({"status": st, "timestamp_brisbane": ts})
 
     @remote_app.route('/start', methods=['POST', 'GET'])
     def api_start():
         if main_app and not main_app._running:
             main_app.after(0, main_app._toggle)
-        return jsonify({"message": "Monitor started or already running"})
+        return jsonify({"message": "Monitor started (or already running)."})
 
     @remote_app.route('/stop', methods=['POST', 'GET'])
     def api_stop():
         if main_app and main_app._running:
             main_app.after(0, main_app._toggle)
-        return jsonify({"message": "Monitor stopped or already stopped"})
+        return jsonify({"message": "Monitor stopped (or already stopped)."})
 
-    import threading
-    t = threading.Thread(target=lambda: remote_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False), daemon=True)
+    # ════════════════════════════════════════════════════════════════════════
+    # Email recipients
+    # ════════════════════════════════════════════════════════════════════════
+
+    @remote_app.route('/add_email', methods=['POST', 'GET'])
+    def api_add_email():
+        email = _param('email')
+        if not email or "@" not in email:
+            return jsonify({"error": "Invalid or missing 'email' parameter."}), 400
+        def _do():
+            if email not in main_app._rec_lb.get(0, "end"):
+                main_app._rec_lb.insert("end", email)
+                main_app._collect_cfg_from_ui()
+                main_app.cfg.save()
+        if main_app:
+            main_app.after(0, _do)
+        return jsonify({"message": f"Email '{email}' added."})
+
+    @remote_app.route('/delete_email', methods=['POST', 'GET', 'DELETE'])
+    def api_delete_email():
+        """Remove an email recipient.  ?email=user@example.com"""
+        email = _param('email')
+        if not email:
+            return jsonify({"error": "Missing 'email' parameter."}), 400
+        def _do():
+            items = list(main_app._rec_lb.get(0, "end"))
+            for i, item in enumerate(items):
+                if item.strip().lower() == email.strip().lower():
+                    main_app._rec_lb.delete(i)
+                    main_app._collect_cfg_from_ui()
+                    main_app.cfg.save()
+                    break
+        if main_app:
+            main_app.after(0, _do)
+        return jsonify({"message": f"Email '{email}' removed (if it existed)."})
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Phone / SMS recipients
+    # ════════════════════════════════════════════════════════════════════════
+
+    @remote_app.route('/add_phone', methods=['POST', 'GET'])
+    def api_add_phone():
+        phone = _param('phone')
+        if not phone:
+            return jsonify({"error": "Missing 'phone' parameter."}), 400
+        def _do():
+            if phone not in main_app._sms_rec_lb.get(0, "end"):
+                main_app._sms_rec_lb.insert("end", phone)
+                main_app._collect_cfg_from_ui()
+                main_app.cfg.save()
+        if main_app:
+            main_app.after(0, _do)
+        return jsonify({"message": f"Phone '{phone}' added."})
+
+    @remote_app.route('/delete_phone', methods=['POST', 'GET', 'DELETE'])
+    def api_delete_phone():
+        """Remove an SMS recipient.  ?phone=+61412345678"""
+        phone = _param('phone')
+        if not phone:
+            return jsonify({"error": "Missing 'phone' parameter."}), 400
+        def _do():
+            items = list(main_app._sms_rec_lb.get(0, "end"))
+            for i, item in enumerate(items):
+                if item.strip() == phone.strip():
+                    main_app._sms_rec_lb.delete(i)
+                    main_app._collect_cfg_from_ui()
+                    main_app.cfg.save()
+                    break
+        if main_app:
+            main_app.after(0, _do)
+        return jsonify({"message": f"Phone '{phone}' removed (if it existed)."})
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Threshold rules
+    # ════════════════════════════════════════════════════════════════════════
+
+    @remote_app.route('/set_threshold', methods=['POST', 'GET'])
+    def api_set_threshold():
+        """Update value/cooldown of existing rules by alert level.
+           ?level=Warning&value=0.25&cooldown=60"""
+        level = _param('level')
+        val   = _param('value')
+        cd    = _param('cooldown')
+        if not level:
+            return jsonify({"error": "Missing 'level' (e.g. Warning or Critical)."}), 400
+        try:
+            val_f = float(val) if val is not None else None
+            cd_i  = int(cd)   if cd  is not None else None
+        except ValueError:
+            return jsonify({"error": "'value' must be float, 'cooldown' must be int."}), 400
+        if val_f is None and cd_i is None:
+            return jsonify({"error": "Provide at least 'value' or 'cooldown'."}), 400
+        def _do():
+            for rule in main_app.cfg.thresholds:
+                if rule.alert_level.lower() == level.lower():
+                    if val_f is not None: rule.value = val_f
+                    if cd_i  is not None: rule.cooldown_minutes = cd_i
+            main_app._refresh_tree()
+            main_app.cfg.save()
+        if main_app:
+            main_app.after(0, _do)
+        parts = []
+        if val_f is not None: parts.append(f"value={val_f}")
+        if cd_i  is not None: parts.append(f"cooldown={cd_i}m")
+        return jsonify({"message": f"Updated '{level}' thresholds: {', '.join(parts)}."})
+
+    @remote_app.route('/delete_threshold', methods=['POST', 'GET', 'DELETE'])
+    def api_delete_threshold():
+        """Delete threshold rule(s) by name, alert level, or 0-based index.
+           ?name=HighVelocity  OR  ?level=Warning  OR  ?index=0"""
+        name  = _param('name')
+        level = _param('level')
+        idx   = _param('index')
+        if not any([name, level, idx]):
+            return jsonify({"error": "Provide 'name', 'level', or 'index'."}), 400
+        def _do():
+            rules     = main_app.cfg.thresholds
+            to_remove = []
+            if idx is not None:
+                try:
+                    i = int(idx)
+                    if 0 <= i < len(rules):
+                        to_remove.append(i)
+                except ValueError:
+                    pass
+            else:
+                for i, r in enumerate(rules):
+                    if name  and r.name.lower()        == name.lower():  to_remove.append(i)
+                    elif level and r.alert_level.lower() == level.lower(): to_remove.append(i)
+            for i in sorted(set(to_remove), reverse=True):
+                del main_app.cfg.thresholds[i]
+            if to_remove:
+                main_app._refresh_tree()
+                main_app.cfg.save()
+        if main_app:
+            main_app.after(0, _do)
+        return jsonify({"message": "Threshold deletion queued.",
+                        "criteria": {"name": name, "level": level, "index": idx}})
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Read-only data endpoints
+    # ════════════════════════════════════════════════════════════════════════
+
+    @remote_app.route('/config', methods=['GET'])
+    def api_config():
+        if not main_app:
+            return jsonify({"error": "App not available"}), 503
+        cfg = main_app.cfg
+        now = time.time()
+        return jsonify({
+            "status"           : "Running" if main_app._running else "Stopped",
+            "project"          : cfg.influx.project,
+            "bucket"           : cfg.influx.bucket,
+            "interval_seconds" : cfg.monitor.interval_seconds,
+            "range_window"     : cfg.influx.range_window,
+            "dimensions"       : cfg.monitor.selected_dimensions,
+            "email_recipients" : list(main_app._rec_lb.get(0, "end")),
+            "sms_enabled"      : cfg.sms.enabled,
+            "sms_recipients"   : list(main_app._sms_rec_lb.get(0, "end")),
+            "thresholds"       : [
+                {
+                    "name"                     : r.name,
+                    "sensor_filter"            : r.sensor_filter,
+                    "dimension"                : r.dimension,
+                    "operator"                 : r.operator,
+                    "value"                    : r.value,
+                    "alert_level"              : r.alert_level,
+                    "cooldown_minutes"         : r.cooldown_minutes,
+                    "enabled"                  : r.enabled,
+                    "cooldown_remaining_seconds": max(0, int(r.cooldown_minutes - (now - r._last_alerted))),
+                }
+                for r in cfg.thresholds
+            ],
+            "timestamp_brisbane": datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S"),
+        })
+
+    @remote_app.route('/violations', methods=['GET'])
+    def api_violations():
+        """Return the last N alert events (default 100).  ?limit=50"""
+        try:   limit = int(request.args.get('limit', 100))
+        except ValueError: limit = 100
+        with _ALERT_HISTORY_LOCK:
+            data = list(ALERT_HISTORY[-limit:])
+        return jsonify({"count": len(data), "violations": data})
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Web Dashboard
+    # ════════════════════════════════════════════════════════════════════════
+
+    DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alert Monitor Dashboard</title>
+<style>
+:root{--bg:#1e2130;--bg-mid:#252a3d;--bg-light:#2a2f45;--acc:#4a9eff;
+  --green:#4ddd88;--red:#ff6b7a;--orange:#ffaa44;--purple:#b48eff;
+  --text:#e8eaf0;--muted:#9aa0b8;--dim:#555e7a;--tb:#16192b;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px}
+header{background:var(--tb);padding:13px 22px;display:flex;align-items:center;
+  justify-content:space-between;border-bottom:1px solid #252a3d;position:sticky;top:0;z-index:10}
+header h1{font-size:17px;color:var(--acc);font-weight:700;letter-spacing:.3px}
+.meta{color:var(--muted);font-size:12px;line-height:1.7}
+.ctrl{display:flex;gap:10px;padding:16px 20px 4px}
+.btn{padding:8px 18px;border-radius:7px;border:none;font-size:13px;font-weight:700;
+  cursor:pointer;transition:filter .15s}
+.btn:hover{filter:brightness(1.15)}
+.btn-green{background:var(--green);color:#0a1a10}
+.btn-red{background:var(--red);color:#fff}
+.btn-acc{background:var(--acc);color:#fff}
+.btn-sm{padding:3px 10px;font-size:11px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;padding:16px 20px}
+.card{background:var(--bg-mid);border-radius:10px;border:1px solid #252a3d;overflow:hidden}
+.card.full{grid-column:1/-1}
+.ch{background:var(--tb);padding:11px 16px;font-size:12px;font-weight:700;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.6px}
+.cb{padding:16px}
+.row{display:flex;justify-content:space-between;align-items:center;
+  padding:8px 0;border-bottom:1px solid #1e2130}
+.row:last-child{border-bottom:none}
+.lbl{color:var(--muted);font-size:13px}
+.val{font-weight:600}
+.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700}
+.bg{background:#1a3a28;color:var(--green)}
+.br{background:#3a1a1e;color:var(--red)}
+.bo{background:#2e2010;color:var(--orange)}
+.bm{background:#2a2f45;color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:middle}
+.dg{background:var(--green);box-shadow:0 0 5px var(--green)}
+.dr{background:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:600;
+  border-bottom:1px solid #2a3050;font-size:11px;text-transform:uppercase;
+  position:sticky;top:0;background:var(--bg-mid)}
+td{padding:7px 10px;border-bottom:1px solid #1e2130;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#2a3050}
+.tag{background:#1e2130;color:var(--muted);border-radius:4px;padding:1px 7px;font-size:12px}
+.pills{display:flex;flex-wrap:wrap;gap:6px}
+.pill{background:var(--bg-light);border:1px solid #3a4060;border-radius:20px;
+  padding:3px 12px;font-size:13px}
+.none{color:var(--dim);font-size:13px;font-style:italic;text-align:center;padding:18px 0}
+.frow{display:flex;gap:8px;margin-top:12px}
+.frow input{flex:1;background:var(--bg-light);border:1px solid #3a4060;color:var(--text);
+  padding:6px 10px;border-radius:6px;font-size:13px;outline:none}
+.frow input:focus{border-color:var(--acc)}
+.fsec{margin-top:12px;padding-top:12px;border-top:1px solid #2a3050}
+.flbl{color:var(--muted);font-size:12px;margin-bottom:4px}
+.cdbar{height:4px;border-radius:2px;background:#2a3050;margin-top:4px}
+.cdfill{height:100%;border-radius:2px;background:var(--orange)}
+.tscroll{max-height:420px;overflow-y:auto}
+#toast{position:fixed;bottom:22px;right:22px;background:#2a2f45;color:var(--text);
+  padding:11px 18px;border-radius:8px;border:1px solid #3a4060;font-size:13px;
+  z-index:999;box-shadow:0 4px 14px #0006;opacity:0;transition:opacity .3s;pointer-events:none}
+.footer{text-align:center;color:var(--dim);font-size:11px;padding:12px;border-top:1px solid #252a3d;margin-top:8px}
+.api-ref{background:var(--tb);border-radius:8px;margin:0 20px 16px;padding:14px 18px}
+.api-ref summary{color:var(--acc);font-weight:700;cursor:pointer;font-size:13px;user-select:none}
+.api-ref table td:first-child{font-family:monospace;color:var(--purple);font-size:12px}
+.api-ref table td{padding:5px 10px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🔔 Alert Monitor — Remote Dashboard</h1>
+    <div class="meta" id="proj-lbl">Connecting…</div>
+  </div>
+  <div class="meta" style="text-align:right">
+    <div>🕐 Brisbane (AEST): <strong id="btime" style="color:var(--text)">—</strong></div>
+    <div id="lupd" style="margin-top:3px">Updating…</div>
+  </div>
+</header>
+
+<div class="ctrl">
+  <button class="btn btn-green" onclick="apiCall('/start','Monitor starting…')">▶ Start</button>
+  <button class="btn btn-red"   onclick="apiCall('/stop','Monitor stopping…')">⏹ Stop</button>
+  <button class="btn btn-acc"   onclick="loadData()">🔄 Refresh</button>
+</div>
+
+<div class="grid">
+
+  <!-- Status -->
+  <div class="card">
+    <div class="ch">📡 System Status</div>
+    <div class="cb">
+      <div class="row"><span class="lbl">Monitor</span><span id="s-status">—</span></div>
+      <div class="row"><span class="lbl">Project</span><span class="val" id="s-proj">—</span></div>
+      <div class="row"><span class="lbl">Bucket</span><span class="val" id="s-bkt">—</span></div>
+      <div class="row"><span class="lbl">Poll interval</span><span class="val" id="s-iv">—</span></div>
+      <div class="row"><span class="lbl">Range window</span><span class="val" id="s-rw">—</span></div>
+      <div class="row"><span class="lbl">Dimensions</span><span class="val" id="s-dims">—</span></div>
+      <div class="row"><span class="lbl">SMS alerts</span><span class="val" id="s-sms">—</span></div>
+    </div>
+  </div>
+
+  <!-- Email -->
+  <div class="card">
+    <div class="ch">📧 Email Recipients</div>
+    <div class="cb">
+      <div class="pills" id="email-list"><span class="none">None configured</span></div>
+      <div class="fsec">
+        <div class="flbl">Add / Remove recipient</div>
+        <div class="frow">
+          <input type="email" id="e-in" placeholder="user@example.com">
+          <button class="btn btn-acc" onclick="addEmail()">Add</button>
+          <button class="btn btn-red" onclick="delEmail()">Remove</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Phone -->
+  <div class="card">
+    <div class="ch">📱 SMS Recipients</div>
+    <div class="cb">
+      <div class="pills" id="phone-list"><span class="none">None configured</span></div>
+      <div class="fsec">
+        <div class="flbl">Add / Remove number (E.164)</div>
+        <div class="frow">
+          <input type="tel" id="p-in" placeholder="+61412345678">
+          <button class="btn btn-acc" onclick="addPhone()">Add</button>
+          <button class="btn btn-red" onclick="delPhone()">Remove</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Thresholds -->
+  <div class="card full">
+    <div class="ch">⚡ Threshold Rules</div>
+    <div class="tscroll">
+      <table>
+        <thead><tr>
+          <th>Name</th><th>Sensor</th><th>Dim</th><th>Op</th><th>Value</th>
+          <th>Level</th><th>Cooldown</th><th>State</th><th>CD Remaining</th><th>Action</th>
+        </tr></thead>
+        <tbody id="thr-body"><tr><td colspan="10" class="none">No thresholds</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Alert history -->
+  <div class="card full">
+    <div class="ch">🚨 Alert History — Brisbane Time (dd/mm/yyyy hh:mm:ss)</div>
+    <div class="tscroll">
+      <table>
+        <thead><tr>
+          <th>Timestamp (AEST)</th><th>Cycle</th><th>Level</th>
+          <th>Rule</th><th>Sensor</th><th>Dim</th><th>Max Value</th><th>Threshold</th><th>Type</th>
+        </tr></thead>
+        <tbody id="viol-body"><tr><td colspan="9" class="none">No alerts recorded yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- API reference -->
+<details class="api-ref">
+  <summary>📖 Remote API reference (click to expand)</summary>
+  <br>
+  <table>
+    <tr><td>GET  /status</td><td>Monitor status + timestamp</td></tr>
+    <tr><td>GET  /config</td><td>Full config JSON (thresholds, emails, cooldowns…)</td></tr>
+    <tr><td>GET  /violations?limit=100</td><td>Alert history JSON</td></tr>
+    <tr><td>POST /start</td><td>Start monitoring</td></tr>
+    <tr><td>POST /stop</td><td>Stop monitoring</td></tr>
+    <tr><td>GET  /add_email?email=…</td><td>Add email recipient</td></tr>
+    <tr><td>GET  /delete_email?email=…</td><td>Remove email recipient</td></tr>
+    <tr><td>GET  /add_phone?phone=…</td><td>Add SMS recipient</td></tr>
+    <tr><td>GET  /delete_phone?phone=…</td><td>Remove SMS recipient</td></tr>
+    <tr><td>GET  /set_threshold?level=Warning&amp;value=0.5&amp;cooldown=60</td><td>Update threshold value / cooldown</td></tr>
+    <tr><td>GET  /delete_threshold?name=…</td><td>Delete rule by name</td></tr>
+    <tr><td>GET  /delete_threshold?level=Warning</td><td>Delete all rules of a level</td></tr>
+    <tr><td>GET  /delete_threshold?index=0</td><td>Delete rule by 0-based index</td></tr>
+  </table>
+</details>
+
+<div class="footer">Auto-refreshes every 30 s &bull; All timestamps in Brisbane / AEST (UTC+10)</div>
+<div id="toast"></div>
+
+<script>
+let _timer;
+
+function pad(n){return String(n).padStart(2,'0')}
+function brisTime(){
+  const now=new Date();
+  // offset already in js ms; add 10h worth
+  const b=new Date(now.getTime()+(10*3600000)-(now.getTimezoneOffset()*60000));
+  return pad(b.getDate())+'/'+pad(b.getMonth()+1)+'/'+b.getFullYear()+
+         ' '+pad(b.getHours())+':'+pad(b.getMinutes())+':'+pad(b.getSeconds());
+}
+
+function toast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.style.opacity='1';
+  clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',3500);
+}
+
+async function apiCall(ep,hint=''){
+  if(hint)toast(hint);
+  try{
+    const r=await fetch(ep,{method:'POST'});
+    const d=await r.json();
+    toast(d.message||d.error||'OK');
+    setTimeout(loadData,900);
+  }catch(e){toast('Error: '+e.message)}
+}
+
+async function addEmail(){
+  const v=document.getElementById('e-in').value.trim();if(!v)return;
+  const r=await fetch('/add_email?email='+encodeURIComponent(v));
+  toast((await r.json()).message||'done');
+  document.getElementById('e-in').value='';setTimeout(loadData,500);
+}
+async function delEmail(){
+  const v=document.getElementById('e-in').value.trim();if(!v)return;
+  const r=await fetch('/delete_email?email='+encodeURIComponent(v));
+  toast((await r.json()).message||'done');
+  document.getElementById('e-in').value='';setTimeout(loadData,500);
+}
+async function addPhone(){
+  const v=document.getElementById('p-in').value.trim();if(!v)return;
+  const r=await fetch('/add_phone?phone='+encodeURIComponent(v));
+  toast((await r.json()).message||'done');
+  document.getElementById('p-in').value='';setTimeout(loadData,500);
+}
+async function delPhone(){
+  const v=document.getElementById('p-in').value.trim();if(!v)return;
+  const r=await fetch('/delete_phone?phone='+encodeURIComponent(v));
+  toast((await r.json()).message||'done');
+  document.getElementById('p-in').value='';setTimeout(loadData,500);
+}
+async function delThreshold(name){
+  if(!confirm('Delete threshold: "'+name+'"?'))return;
+  const r=await fetch('/delete_threshold?name='+encodeURIComponent(name),{method:'POST'});
+  toast((await r.json()).message||'done');setTimeout(loadData,500);
+}
+
+function renderCfg(c){
+  document.getElementById('proj-lbl').textContent=
+    'Project: '+(c.project||'—')+'  |  Bucket: '+(c.bucket||'—');
+  document.getElementById('s-proj').textContent=c.project||'—';
+  document.getElementById('s-bkt').textContent=c.bucket||'—';
+  document.getElementById('s-iv').textContent=(c.interval_seconds||'—')+'s';
+  document.getElementById('s-rw').textContent=c.range_window||'—';
+  document.getElementById('s-dims').textContent=(c.dimensions||[]).join(', ')||'—';
+  const run=c.status&&(c.status.includes('Running'));
+  document.getElementById('s-status').innerHTML=run
+    ?'<span class="badge bg"><span class="dot dg"></span>Running</span>'
+    :'<span class="badge br"><span class="dot dr"></span>Stopped</span>';
+  document.getElementById('s-sms').innerHTML=c.sms_enabled
+    ?'<span class="badge bg">Enabled</span>'
+    :'<span class="badge bm">Disabled</span>';
+
+  // emails
+  const el=document.getElementById('email-list');
+  el.innerHTML=c.email_recipients&&c.email_recipients.length
+    ?c.email_recipients.map(e=>'<span class="pill">'+e+'</span>').join('')
+    :'<span class="none">None configured</span>';
+
+  // phones
+  const pl=document.getElementById('phone-list');
+  pl.innerHTML=c.sms_recipients&&c.sms_recipients.length
+    ?c.sms_recipients.map(p=>'<span class="pill">'+p+'</span>').join('')
+    :'<span class="none">None configured</span>';
+
+  // thresholds
+  const tb=document.getElementById('thr-body');
+  if(c.thresholds&&c.thresholds.length){
+    tb.innerHTML=c.thresholds.map((t,i)=>{
+      const rem=t.cooldown_remaining_seconds||0;
+      const pct=rem>0?Math.min(100,Math.round(rem/t.cooldown_minutes*100)):0;
+      const cdStr=rem>0?(rem>=60?Math.floor(rem/60)+'m '+(rem%60)+'s':rem+'s'):'—';
+      const cdBar=rem>0?'<div class="cdbar"><div class="cdfill" style="width:'+pct+'%"></div></div>':'';
+      const lb=t.alert_level==='Critical'
+        ?'<span class="badge br">Critical</span>'
+        :'<span class="badge bo">Warning</span>';
+      const eb=t.enabled
+        ?'<span class="badge bg">✓ On</span>'
+        :'<span class="badge bm">✗ Off</span>';
+      return '<tr>'+
+        '<td>'+t.name+'</td>'+
+        '<td><span class="tag">'+t.sensor_filter+'</span></td>'+
+        '<td><span class="tag">'+t.dimension+'</span></td>'+
+        '<td>'+t.operator+'</td>'+
+        '<td><strong>'+t.value+'</strong></td>'+
+        '<td>'+lb+'</td>'+
+        '<td>'+t.cooldown_minutes+'s</td>'+
+        '<td>'+eb+'</td>'+
+        '<td>'+cdStr+cdBar+'</td>'+
+        '<td><button class="btn btn-red btn-sm" onclick="delThreshold(\''+
+          t.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')" >Delete</button></td>'+
+        '</tr>';
+    }).join('');
+  }else{
+    tb.innerHTML='<tr><td colspan="10" class="none">No thresholds configured</td></tr>';
+  }
+}
+
+function renderViolations(hist){
+  const vb=document.getElementById('viol-body');
+  if(!hist||!hist.length){
+    vb.innerHTML='<tr><td colspan="9" class="none">No alerts recorded yet this session</td></tr>';
+    return;
+  }
+  const rows=[];
+  for(const entry of [...hist].reverse()){
+    for(const v of (entry.violations||[])){
+      const lb=v.alert_level==='Critical'
+        ?'<span class="badge br">Critical</span>'
+        :'<span class="badge bo">Warning</span>';
+      const tb=v.type==='pending'
+        ?'<span class="badge bm">Pending</span>'
+        :'<span class="badge bg">New</span>';
+      const mv=typeof v.max_value==='number'?v.max_value.toFixed(5):v.max_value;
+      const th=typeof v.threshold==='number'?v.threshold.toFixed(5):v.threshold;
+      rows.push('<tr>'+
+        '<td style="white-space:nowrap;font-size:12px">'+entry.timestamp+'</td>'+
+        '<td>'+entry.cycle+'</td>'+
+        '<td>'+lb+'</td>'+
+        '<td>'+v.rule+'</td>'+
+        '<td><span class="tag">'+v.sensor+'</span></td>'+
+        '<td><span class="tag">'+v.dimension+'</span></td>'+
+        '<td><strong>'+mv+'</strong></td>'+
+        '<td>'+th+'</td>'+
+        '<td>'+tb+'</td>'+
+        '</tr>');
+    }
+  }
+  vb.innerHTML=rows.join('');
+}
+
+async function loadData(){
+  clearTimeout(_timer);
+  document.getElementById('btime').textContent=brisTime();
+  try{
+    const [cr,vr]=await Promise.all([fetch('/config'),fetch('/violations?limit=200')]);
+    const cfg=await cr.json();
+    const vd=await vr.json();
+    renderCfg(cfg);
+    renderViolations(vd.violations||[]);
+    document.getElementById('lupd').textContent='Updated: '+brisTime();
+  }catch(e){
+    document.getElementById('lupd').textContent='Update failed: '+e.message;
+  }
+  _timer=setTimeout(loadData,30000);
+}
+
+loadData();
+</script>
+</body>
+</html>"""
+
+    @remote_app.route('/', methods=['GET'])
+    @remote_app.route('/dashboard', methods=['GET'])
+    def dashboard():
+        return Response(DASHBOARD_HTML, mimetype='text/html')
+
+    t = threading.Thread(
+        target=lambda: remote_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False),
+        daemon=True)
     t.start()
+
+def _launch_ngrok():
+    """Write and launch start_ngrok.bat in the background (minimized, no console window)."""
+    bat_path = Path(__file__).parent / "start_ngrok.bat"
+    bat_content = (
+        "@echo off\n"
+        "ngrok config add-authtoken 3CQbgf7WZXEdHR5T6Qk1YUIGoQU_7nBiBHATSpZzxhhsrBhcZ\n"
+        "ngrok http 5000\n"
+    )
+    try:
+        bat_path.write_text(bat_content, encoding="utf-8")
+    except Exception as e:
+        print(f"ngrok: could not write bat file: {e}"); return
+    try:
+        import subprocess
+        subprocess.Popen(
+            ["cmd", "/c", "start", "/min", str(bat_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            shell=False,
+        )
+        print(f"ngrok launcher started in background: {bat_path}")
+    except Exception as e:
+        print(f"ngrok: failed to launch: {e}")
+
 
 if __name__ == "__main__":
     missing = []
@@ -3017,6 +3793,7 @@ if __name__ == "__main__":
         print("Optional/required packages not found:")
         for m in missing:
             print(f"  pip install {m}")
+    _launch_ngrok()
     app = App()
     try:
         import importlib.util
